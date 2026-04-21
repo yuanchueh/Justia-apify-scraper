@@ -1,0 +1,13 @@
+{
+    "actorSpecification": 1,
+    "name": "Justia-Scraper",
+    "version": "0.0",
+    "input": "./input_schema.json",
+    "dockerfile": "./Dockerfile",
+    "storages": {
+        "dataset": "./dataset_schema.json"
+    },
+    "metadata": {
+        "generatedBy": "Claude Code with Claude Opus 4.6"
+    }
+}

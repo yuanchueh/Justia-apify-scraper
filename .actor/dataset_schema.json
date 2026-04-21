@@ -1,0 +1,36 @@
+{
+    "actorSpecification": 1,
+    "views": {
+        "overview": {
+            "title": "Justia Attorneys",
+            "description": "Scraped attorney profiles from Justia lawyer directory",
+            "transformation": {
+                "fields": [
+                    "name",
+                    "firmName",
+                    "rating",
+                    "reviewCount",
+                    "practiceAreas",
+                    "location",
+                    "phone",
+                    "website",
+                    "profileUrl"
+                ]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "name": { "label": "Name", "format": "text" },
+                    "firmName": { "label": "Firm", "format": "text" },
+                    "rating": { "label": "Rating", "format": "number" },
+                    "reviewCount": { "label": "Reviews", "format": "number" },
+                    "practiceAreas": { "label": "Practice Areas", "format": "text" },
+                    "location": { "label": "Location", "format": "text" },
+                    "phone": { "label": "Phone", "format": "text" },
+                    "website": { "label": "Website", "format": "link" },
+                    "profileUrl": { "label": "Profile", "format": "link" }
+                }
+            }
+        }
+    }
+}

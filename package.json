@@ -1,0 +1,19 @@
+{
+    "name": "justia-scraper",
+    "version": "0.0.1",
+    "type": "module",
+    "description": "Apify actor to scrape attorney profiles from Justia.com lawyer directory",
+    "engines": {
+        "node": ">=18"
+    },
+    "dependencies": {
+        "apify": "^3.2.0",
+        "cheerio": "^1.0.0",
+        "crawlee": "^3.11.0",
+        "got-scraping": "^4.0.0"
+    },
+    "scripts": {
+        "start": "node src/main.js"
+    },
+    "author": "yuanchueh"
+}

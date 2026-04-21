@@ -1,0 +1,47 @@
+{
+    "title": "Justia Lawyer Directory Scraper",
+    "description": "Scrapes attorney profiles from Justia.com lawyer directory listings by state and practice area.",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "startUrl": {
+            "title": "Start URL",
+            "type": "string",
+            "description": "Justia lawyer directory listing URL (e.g. https://www.justia.com/lawyers/personal-injury/kansas)",
+            "editor": "textfield",
+            "prefill": "https://www.justia.com/lawyers/personal-injury/kansas"
+        },
+        "maxLawyers": {
+            "title": "Max Lawyers",
+            "type": "integer",
+            "description": "Maximum number of lawyer profiles to scrape (0 = unlimited)",
+            "default": 20,
+            "minimum": 0
+        },
+        "maxListingPages": {
+            "title": "Max Listing Pages",
+            "type": "integer",
+            "description": "Maximum number of listing pages to crawl",
+            "default": 10,
+            "minimum": 1
+        },
+        "enrichProfiles": {
+            "title": "Enrich Profiles",
+            "type": "boolean",
+            "description": "Visit individual profile pages for additional data (firm name, bio, bar admissions, etc.)",
+            "default": true
+        },
+        "proxyConfiguration": {
+            "title": "Proxy Configuration",
+            "type": "object",
+            "description": "Apify proxy configuration. US residential proxies required for Justia (Cloudflare).",
+            "editor": "proxy",
+            "default": {
+                "useApifyProxy": true,
+                "apifyProxyGroups": ["RESIDENTIAL"],
+                "apifyProxyCountry": "US"
+            }
+        }
+    },
+    "required": ["startUrl"]
+}
