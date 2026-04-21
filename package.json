@@ -4,7 +4,7 @@
     "type": "module",
     "description": "Apify actor to scrape attorney profiles from Justia.com lawyer directory",
     "engines": {
-        "node": ">=18"
+        "node": ">=20"
     },
     "dependencies": {
         "apify": "^3.2.0",
