@@ -9,7 +9,7 @@
  */
 
 import { Actor, log } from 'apify';
-import { CheerioCrawler, ProxyConfiguration } from 'crawlee';
+import { CheerioCrawler } from 'crawlee';
 import { gotScraping } from 'got-scraping';
 import * as cheerio from 'cheerio';
 
@@ -109,13 +109,10 @@ if (!startUrl) {
     throw new Error('startUrl is required');
 }
 
-const proxyConfiguration = proxyInput
-    ? new ProxyConfiguration(proxyInput)
-    : new ProxyConfiguration({
-        useApifyProxy: true,
-        groups: ['RESIDENTIAL'],
-        countryCode: 'US',
-    });
+const proxyConfiguration = await Actor.createProxyConfiguration(proxyInput || {
+    groups: ['RESIDENTIAL'],
+    countryCode: 'US',
+});
 
 // ── State ──────────────────────────────────────────────────────────────────
 const seenProfileUrls = new Set();
