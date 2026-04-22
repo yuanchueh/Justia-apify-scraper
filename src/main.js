@@ -210,16 +210,24 @@ const crawler = new CheerioCrawler({
                 if (outlineText) practiceAreas = [outlineText];
             }
 
-            // Location: div.address.-hide-desktop, or extract from div.rating span
+            // Location: div.address, or extract from div.rating span
             let location = '';
             const addressEl = $card.find('div.address').first();
             if (addressEl.length) {
-                // Parse "Street\nCity, ST ZIP" — take last line for city/state
-                const lines = addressEl.text().trim().split('\n').map((l) => l.trim()).filter(Boolean);
-                location = lines.length > 0 ? lines[lines.length - 1] : '';
+                // Normalize whitespace (tabs, newlines, multiple spaces → single space)
+                const raw = addressEl.text().replace(/[\t\n\r]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
+                // Extract "City, ST ZIP" pattern from the address text
+                const cityStateZip = raw.match(/([A-Za-z\s.]+,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?)/);
+                if (cityStateZip) {
+                    location = cityStateZip[1].trim();
+                } else {
+                    // Fallback: "City, ST" without ZIP
+                    const cityState = raw.match(/([A-Za-z\s.]+,\s*[A-Z]{2})\b/);
+                    location = cityState ? cityState[1].trim() : raw;
+                }
             }
             if (!location) {
-                // Fallback: extract "City, ST" from rating div text like "Overland Park, KS Personal Injury..."
+                // Fallback: extract "City, ST" from rating div text
                 const ratingDiv = $card.find('div.rating > span').first().text().trim();
                 const locMatch = ratingDiv.match(/^([A-Za-z\s.]+,\s*[A-Z]{2})\b/);
                 if (locMatch) location = locMatch[1].trim();
@@ -368,6 +376,13 @@ if (enrichProfiles && lawyersToEnrich.length > 0) {
                             proxyUrl,
                             responseType: 'text',
                             timeout: { request: 30000 },
+                            headers: {
+                                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                                'Accept-Language': 'en-US,en;q=0.9',
+                                'Accept-Encoding': 'gzip, deflate, br',
+                                'Cache-Control': 'no-cache',
+                                'Referer': 'https://www.justia.com/lawyers/',
+                            },
                         });
 
                         stats.totalRequests++;
@@ -375,7 +390,7 @@ if (enrichProfiles && lawyersToEnrich.length > 0) {
                         if ([403, 429, 503].includes(response.statusCode)) {
                             stats.blockedRequests++;
                             log.warning(`Blocked on profile: ${lawyer.profileUrl} (${response.statusCode})`);
-                            return lawyer; // return un-enriched
+                            return lawyer;
                         }
 
                         const html = response.body;
@@ -385,76 +400,98 @@ if (enrichProfiles && lawyersToEnrich.length > 0) {
                             return lawyer;
                         }
 
+                        // Save first successful profile HTML for debugging
+                        if (stats.profileEnrichments === 0) {
+                            const kvStore = await Actor.openKeyValueStore();
+                            await kvStore.setValue('DEBUG_PROFILE_SAMPLE', html, { contentType: 'text/html' });
+                            log.info(`Saved debug profile HTML for ${lawyer.profileUrl} (${html.length} chars)`);
+                        }
+
                         const $ = cheerio.load(html);
                         stats.profileEnrichments++;
 
-                        // JSON-LD first
+                        // JSON-LD first — Justia profile pages include structured data
                         const jsonLd = extractJsonLd($);
                         if (jsonLd) {
+                            log.debug(`JSON-LD found for ${lawyer.name}: @type=${jsonLd['@type']}`);
                             lawyer.firmName = lawyer.firmName
                                 || jsonLd.worksFor?.name
                                 || jsonLd.memberOf?.name
-                                || extractFirmName($);
+                                || '';
 
                             if (jsonLd.geo) {
-                                lawyer.latitude = jsonLd.geo.latitude || null;
-                                lawyer.longitude = jsonLd.geo.longitude || null;
+                                lawyer.latitude = parseFloat(jsonLd.geo.latitude) || null;
+                                lawyer.longitude = parseFloat(jsonLd.geo.longitude) || null;
                             }
 
                             if (jsonLd.description) {
                                 lawyer.biography = jsonLd.description.substring(0, 2000);
                             }
-                        } else {
-                            lawyer.firmName = lawyer.firmName || extractFirmName($);
+
+                            // Bar admissions from JSON-LD
+                            if (jsonLd.hasCredential) {
+                                const creds = Array.isArray(jsonLd.hasCredential) ? jsonLd.hasCredential : [jsonLd.hasCredential];
+                                for (const cred of creds) {
+                                    const credText = cred.name || cred.credentialCategory || '';
+                                    if (credText) lawyer.barAdmissions.push(credText);
+                                }
+                            }
+
+                            // Education from JSON-LD
+                            if (jsonLd.alumniOf) {
+                                const schools = Array.isArray(jsonLd.alumniOf) ? jsonLd.alumniOf : [jsonLd.alumniOf];
+                                for (const school of schools) {
+                                    const name = school.name || (typeof school === 'string' ? school : '');
+                                    if (name) lawyer.education.push(name);
+                                }
+                            }
                         }
 
-                        // HTML fallback enrichment
+                        // Firm name from HTML if not found in JSON-LD
+                        if (!lawyer.firmName) {
+                            lawyer.firmName = extractFirmName($);
+                        }
+
+                        // Biography from HTML if not found in JSON-LD
                         if (!lawyer.biography) {
-                            const bioEl = $('[itemprop="description"], .attorney-bio, .profile-bio').first();
+                            const bioEl = $('[itemprop="description"], .profile-blurb, .attorney-bio').first();
                             lawyer.biography = bioEl.text().trim().substring(0, 2000);
                         }
 
-                        // Bar admissions
-                        const barEls = $('.bar-admission, [itemprop="hasCredential"]').toArray();
-                        for (const el of barEls) {
-                            const text = $(el).text().trim();
-                            if (text) lawyer.barAdmissions.push(text);
+                        // Bar admissions from HTML if not found in JSON-LD
+                        if (lawyer.barAdmissions.length === 0) {
+                            $('[itemprop="hasCredential"], .bar-admission, .license-item').each((_, el) => {
+                                const text = $(el).text().trim();
+                                if (text && text.length < 200) lawyer.barAdmissions.push(text);
+                            });
                         }
 
-                        // Education
-                        const eduEls = $('.education-entry, [itemprop="alumniOf"]').toArray();
-                        for (const el of eduEls) {
-                            const text = $(el).text().trim();
-                            if (text) lawyer.education.push(text);
+                        // Education from HTML if not found in JSON-LD
+                        if (lawyer.education.length === 0) {
+                            $('[itemprop="alumniOf"], .education-entry').each((_, el) => {
+                                const text = $(el).text().trim();
+                                if (text && text.length < 200) lawyer.education.push(text);
+                            });
                         }
 
                         // Languages
-                        const langEls = $('.language, [itemprop="knowsLanguage"]').toArray();
-                        for (const el of langEls) {
+                        $('[itemprop="knowsLanguage"], .language').each((_, el) => {
                             const text = $(el).text().trim();
                             if (text) lawyer.languages.push(text);
-                        }
+                        });
 
-                        // Years experience
-                        const yearsEl = $('[itemprop="yearsOfExperience"], .years-experience').first().text();
-                        const yearsMatch = yearsEl.match(/(\d+)/);
-                        if (yearsMatch) lawyer.yearsExperience = parseInt(yearsMatch[1], 10);
-
-                        // Associations
-                        const assocEls = $('.association, [itemprop="memberOf"]').toArray();
-                        for (const el of assocEls) {
+                        // Associations / memberships
+                        $('[itemprop="memberOf"], .association, .organization').each((_, el) => {
                             const text = $(el).text().trim();
                             if (text && text.length < 200) lawyer.associations.push(text);
-                        }
-
-                        // Claimed profile indicator
-                        lawyer.justiaClaimedProfile = !!$('.claimed-badge, .verified-badge, [data-claimed="true"]').length;
+                        });
 
                         // Website from profile page (if not found in listing)
                         if (!lawyer.website) {
-                            const profileWebsite = $('a[data-button-tag="website"], a.website-link').first().attr('href') || '';
-                            if (!isBlockedWebsite(profileWebsite)) {
-                                lawyer.website = profileWebsite;
+                            const profileWebsite = $('a[aria-label$="Website"].rio-button, a[data-button-tag="website"]').first().attr('href') || '';
+                            const cleaned = profileWebsite.split('?utm_source=justia')[0];
+                            if (!isBlockedWebsite(cleaned)) {
+                                lawyer.website = cleaned;
                             }
                         }
 
