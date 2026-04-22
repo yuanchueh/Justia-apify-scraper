@@ -190,43 +190,99 @@ const crawler = new CheerioCrawler({
             if (!profileUrl || seenProfileUrls.has(profileUrl)) continue;
             seenProfileUrls.add(profileUrl);
 
-            // Name
-            const name = profileLink.text().trim()
-                || $card.find('strong.name a, .lawyer-name a').first().text().trim();
+            // Name: strong.name a
+            const name = $card.find('strong.name a').first().text().trim()
+                || profileLink.text().trim();
 
-            // Practice areas: jicon-gavel span, then comma-split fallback
+            // Practice areas: span containing jicon-gavel, text is in the parent span
             let practiceAreas = [];
-            const paSpan = $card.find('.jicon-gavel').next('span').text().trim()
-                || $card.find('.practice-areas').text().trim();
-            if (paSpan) {
-                practiceAreas = paSpan.split(',').map((s) => s.trim()).filter(Boolean);
+            const gavelParent = $card.find('.jicon-gavel').closest('.iconed-line-small');
+            if (gavelParent.length) {
+                // Get text content, excluding the icon span itself
+                const paText = gavelParent.clone().children('.jicon').remove().end().text().trim();
+                if (paText) {
+                    practiceAreas = paText.split(',').map((s) => s.trim()).filter(Boolean);
+                }
+            }
+            // Premium cards: practice area in div.outline
+            if (practiceAreas.length === 0) {
+                const outlineText = $card.find('div.outline').first().text().trim();
+                if (outlineText) practiceAreas = [outlineText];
             }
 
-            // Location
-            const location = $card.find('.jld-card-location, .lawyer-location, .location').first().text().trim();
+            // Location: div.address.-hide-desktop, or extract from div.rating span
+            let location = '';
+            const addressEl = $card.find('div.address').first();
+            if (addressEl.length) {
+                // Parse "Street\nCity, ST ZIP" — take last line for city/state
+                const lines = addressEl.text().trim().split('\n').map((l) => l.trim()).filter(Boolean);
+                location = lines.length > 0 ? lines[lines.length - 1] : '';
+            }
+            if (!location) {
+                // Fallback: extract "City, ST" from rating div text like "Overland Park, KS Personal Injury..."
+                const ratingDiv = $card.find('div.rating > span').first().text().trim();
+                const locMatch = ratingDiv.match(/^([A-Za-z\s.]+,\s*[A-Z]{2})\b/);
+                if (locMatch) location = locMatch[1].trim();
+            }
 
-            // Phone
-            const phoneEl = $card.find('a[href^="tel:"]').first();
+            // Phone: strong.phone a or a[href^="tel:"]
+            const phoneEl = $card.find('strong.phone a').first();
             const phone = phoneEl.text().trim()
-                || (phoneEl.attr('href') || '').replace('tel:', '');
+                || (phoneEl.attr('href') || '').replace(/^tel:\+?1?-?/, '');
 
-            // Rating
-            const ratingText = $card.find('.rating strong, .lawyer-rating').first().text().trim();
-            const rating = ratingText ? parseFloat(ratingText) || null : null;
+            // Rating: star image filename encodes rating (stars-5-0.svg = 5.0)
+            let rating = null;
+            const starImg = $card.find('div.rating img[src*="stars-"]').first();
+            if (starImg.length) {
+                const starMatch = (starImg.attr('src') || '').match(/stars-(\d+)-(\d+)\.svg/);
+                if (starMatch) rating = parseFloat(`${starMatch[1]}.${starMatch[2]}`);
+            }
+            // Also check for "10/10" text rating
+            if (rating === null) {
+                const ratingStrong = $card.find('div.rating strong').first().text().trim();
+                const numMatch = ratingStrong.match(/(\d+(?:\.\d+)?)\s*\/\s*10/);
+                if (numMatch) rating = parseFloat(numMatch[1]);
+            }
 
-            // Review count
-            const reviewText = $card.find('.review-count, .reviews').first().text().trim();
-            const reviewMatch = reviewText.match(/(\d+)/);
-            const reviewCount = reviewMatch ? parseInt(reviewMatch[1], 10) : 0;
+            // Review count: "N Peer Review(s)" in rating div
+            let reviewCount = 0;
+            const ratingArea = $card.find('div.rating').first().text();
+            const reviewMatch = ratingArea.match(/\((\d+)\s+Peer\s+Reviews?\)/i);
+            if (reviewMatch) reviewCount = parseInt(reviewMatch[1], 10);
 
-            // Website from listing card
-            const websiteEl = $card.find('a[data-button-tag="website"]').first();
+            // Years of experience from rating div text
+            let yearsExperience = null;
+            const yearsMatch = ratingArea.match(/(\d+)\s+years?\s+of\s+experience/i);
+            if (yearsMatch) yearsExperience = parseInt(yearsMatch[1], 10);
+
+            // Website: aria-label ending in "Website"
+            const websiteEl = $card.find('a[aria-label$="Website"].rio-button').first();
             let website = websiteEl.attr('href') || '';
+            // Strip Justia UTM tracking params
+            if (website) {
+                try { website = website.split('?utm_source=justia')[0]; } catch {}
+            }
             if (isBlockedWebsite(website)) website = '';
+
+            // Claimed profile badge
+            const justiaClaimedProfile = !!$card.find('.rclaimed, .-j_claimed').length
+                || $card.hasClass('-j_claimed');
+
+            // Law school from listing card
+            const lawSchool = $card.find('.jicon-education').closest('.iconed-line-small')
+                .clone().children('.jicon').remove().end().text().trim();
+
+            // Card tier (premium/gold/organic/claimed)
+            const isPremium = $card.hasClass('-premium');
+            const isGold = $card.hasClass('-gold');
+            const cardTier = isPremium ? 'premium' : isGold ? 'gold' : 'organic';
+
+            // Justia profile ID from data attribute
+            const justiaProfileId = $card.attr('data-vars-profile') || '';
 
             const lawyer = {
                 name,
-                firmName: '',
+                firmName: '', // only available from profile page
                 profileUrl,
                 practiceAreas,
                 location,
@@ -238,10 +294,13 @@ const crawler = new CheerioCrawler({
                 biography: '',
                 barAdmissions: [],
                 education: [],
+                lawSchool,
                 languages: [],
-                yearsExperience: null,
+                yearsExperience,
                 associations: [],
-                justiaClaimedProfile: false,
+                justiaClaimedProfile,
+                justiaProfileId,
+                cardTier,
                 latitude: null,
                 longitude: null,
                 source: 'justia',
