@@ -25,12 +25,6 @@
             "default": 10,
             "minimum": 1
         },
-        "enrichProfiles": {
-            "title": "Enrich Profiles",
-            "type": "boolean",
-            "description": "Visit individual profile pages for additional data (firm name, bio, bar admissions, etc.)",
-            "default": true
-        },
         "proxyConfiguration": {
             "title": "Proxy Configuration",
             "type": "object",

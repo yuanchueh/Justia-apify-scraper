@@ -7,13 +7,13 @@
             "transformation": {
                 "fields": [
                     "name",
-                    "firmName",
-                    "rating",
-                    "reviewCount",
                     "practiceAreas",
                     "location",
                     "phone",
                     "website",
+                    "lawSchool",
+                    "yearsExperience",
+                    "cardTier",
                     "profileUrl"
                 ]
             },
@@ -21,13 +21,13 @@
                 "component": "table",
                 "properties": {
                     "name": { "label": "Name", "format": "text" },
-                    "firmName": { "label": "Firm", "format": "text" },
-                    "rating": { "label": "Rating", "format": "number" },
-                    "reviewCount": { "label": "Reviews", "format": "number" },
                     "practiceAreas": { "label": "Practice Areas", "format": "text" },
                     "location": { "label": "Location", "format": "text" },
                     "phone": { "label": "Phone", "format": "text" },
                     "website": { "label": "Website", "format": "link" },
+                    "lawSchool": { "label": "Law School", "format": "text" },
+                    "yearsExperience": { "label": "Years Exp.", "format": "number" },
+                    "cardTier": { "label": "Tier", "format": "text" },
                     "profileUrl": { "label": "Profile", "format": "link" }
                 }
             }

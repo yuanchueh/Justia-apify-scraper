@@ -1,17 +1,18 @@
 /**
  * Justia Lawyer Directory Scraper — Apify Actor
  *
- * Two-phase extraction:
- *   Phase 1: Scrape listing pages (div.jld-card) for bulk attorney data
- *   Phase 2: Enrich via individual profile pages (JSON-LD + HTML fallback)
+ * Scrapes attorney listing pages from Justia.com (div.jld-card).
+ * Extracts: name, phone, website, practiceAreas, location, lawSchool,
+ * yearsExperience, cardTier, justiaClaimedProfile, justiaProfileId.
+ *
+ * Profile enrichment (firmName, bio, barAdmissions) is handled downstream
+ * in the Python pipeline via firm website scraping.
  *
  * Requires US residential proxies — Justia uses Cloudflare IP-tier blocking.
  */
 
 import { Actor, log } from 'apify';
 import { CheerioCrawler } from 'crawlee';
-import { gotScraping } from 'got-scraping';
-import * as cheerio from 'cheerio';
 
 // ── Blocked website hosts (social media, directories) ──────────────────────
 const BLOCKED_WEBSITE_HOSTS = new Set([
@@ -50,37 +51,6 @@ function isCloudflareBlocked(html) {
     );
 }
 
-// ── JSON-LD extraction from profile pages ──────────────────────────────────
-const LEGAL_JSONLD_TYPES = new Set([
-    'Attorney', 'Person', 'LegalService', 'LocalBusiness',
-]);
-
-function extractJsonLd($) {
-    const scripts = $('script[type="application/ld+json"]');
-    for (let i = 0; i < scripts.length; i++) {
-        try {
-            const data = JSON.parse($(scripts[i]).html());
-            const items = Array.isArray(data) ? data : [data];
-            for (const item of items) {
-                const types = Array.isArray(item['@type']) ? item['@type'] : [item['@type']];
-                if (types.some((t) => LEGAL_JSONLD_TYPES.has(t))) {
-                    return item;
-                }
-            }
-        } catch { /* ignore malformed JSON-LD */ }
-    }
-    return null;
-}
-
-// ── Firm name extraction from profile pages ────────────────────────────────
-function extractFirmName($) {
-    // schema.org itemprop only — no heading heuristic (too error-prone)
-    return $('[itemprop="worksFor"]').text().trim()
-        || $('[itemprop="memberOf"]').text().trim()
-        || $('[itemprop="affiliation"]').text().trim()
-        || '';
-}
-
 // ── Main actor ─────────────────────────────────────────────────────────────
 await Actor.init();
 
@@ -89,7 +59,6 @@ const {
     startUrl,
     maxLawyers = 20,
     maxListingPages = 10,
-    enrichProfiles = true,
     proxyConfiguration: proxyInput,
 } = input ?? {};
 
@@ -104,17 +73,15 @@ const proxyConfiguration = await Actor.createProxyConfiguration(proxyInput || {
 
 // ── State ──────────────────────────────────────────────────────────────────
 const seenProfileUrls = new Set();
-const lawyersToEnrich = [];
 const stats = {
     totalLawyersScraped: 0,
     pagesProcessed: 0,
-    profileEnrichments: 0,
     blockedRequests: 0,
     totalRequests: 0,
 };
 let debugPageCount = 0;
 
-// ── Phase 1: Listing crawler ───────────────────────────────────────────────
+// ── Listing crawler ────────────────────────────────────────────────────────
 const crawler = new CheerioCrawler({
     proxyConfiguration,
     maxRequestRetries: 8,
@@ -186,7 +153,6 @@ const crawler = new CheerioCrawler({
             let practiceAreas = [];
             const gavelParent = $card.find('.jicon-gavel').closest('.iconed-line-small');
             if (gavelParent.length) {
-                // Get text content, excluding the icon span itself
                 const paText = gavelParent.clone().children('.jicon').remove().end().text().trim();
                 if (paText) {
                     practiceAreas = paText.split(',').map((s) => s.trim()).filter(Boolean);
@@ -202,20 +168,14 @@ const crawler = new CheerioCrawler({
             let location = '';
             const addressEl = $card.find('div.address').first();
             if (addressEl.length) {
-                // Normalize whitespace (tabs, newlines, multiple spaces → single space)
                 const raw = addressEl.text().replace(/[\t\n\r]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
-                // Extract "City, ST ZIP" — city is word chars only (no digits) before comma
-                // This avoids capturing street fragments like "S Hillside St" or "th St."
                 const cityStateZip = raw.match(/\b([A-Za-z][A-Za-z\s.]*[A-Za-z]),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)/);
                 if (cityStateZip) {
-                    // Take only the last word(s) that look like a city name
-                    // Split on common street suffixes to isolate the city
                     let city = cityStateZip[1];
                     const streetSuffixCut = city.match(/(?:St\.?|Street|Ave\.?|Avenue|Blvd\.?|Rd\.?|Road|Dr\.?|Drive|Ct\.?|Ln\.?|Way|Suite|Ste\.?)\s+(.+)$/i);
                     if (streetSuffixCut) city = streetSuffixCut[1];
                     location = `${city.trim()}, ${cityStateZip[2]} ${cityStateZip[3]}`;
                 } else {
-                    // Fallback: "City, ST" without ZIP
                     const cityState = raw.match(/\b([A-Za-z][A-Za-z\s.]*[A-Za-z]),\s*([A-Z]{2})\b/);
                     if (cityState) {
                         let city = cityState[1];
@@ -228,46 +188,25 @@ const crawler = new CheerioCrawler({
                 }
             }
             if (!location) {
-                // Fallback: extract "City, ST" from rating div text
                 const ratingDiv = $card.find('div.rating > span').first().text().trim();
                 const locMatch = ratingDiv.match(/^([A-Za-z\s.]+,\s*[A-Z]{2})\b/);
                 if (locMatch) location = locMatch[1].trim();
             }
 
-            // Phone: strong.phone a or a[href^="tel:"]
+            // Phone: strong.phone a
             const phoneEl = $card.find('strong.phone a').first();
             const phone = phoneEl.text().trim()
                 || (phoneEl.attr('href') || '').replace(/^tel:\+?1?-?/, '');
 
-            // Rating: star image filename encodes rating (stars-5-0.svg = 5.0)
-            let rating = null;
-            const starImg = $card.find('div.rating img[src*="stars-"]').first();
-            if (starImg.length) {
-                const starMatch = (starImg.attr('src') || '').match(/stars-(\d+)-(\d+)\.svg/);
-                if (starMatch) rating = parseFloat(`${starMatch[1]}.${starMatch[2]}`);
-            }
-            // Also check for "10/10" text rating
-            if (rating === null) {
-                const ratingStrong = $card.find('div.rating strong').first().text().trim();
-                const numMatch = ratingStrong.match(/(\d+(?:\.\d+)?)\s*\/\s*10/);
-                if (numMatch) rating = parseFloat(numMatch[1]);
-            }
-
-            // Review count: "N Peer Review(s)" in rating div
-            let reviewCount = 0;
-            const ratingArea = $card.find('div.rating').first().text();
-            const reviewMatch = ratingArea.match(/\((\d+)\s+Peer\s+Reviews?\)/i);
-            if (reviewMatch) reviewCount = parseInt(reviewMatch[1], 10);
-
             // Years of experience from rating div text
             let yearsExperience = null;
+            const ratingArea = $card.find('div.rating').first().text();
             const yearsMatch = ratingArea.match(/(\d+)\s+years?\s+of\s+experience/i);
             if (yearsMatch) yearsExperience = parseInt(yearsMatch[1], 10);
 
             // Website: aria-label ending in "Website"
             const websiteEl = $card.find('a[aria-label$="Website"].rio-button').first();
             let website = websiteEl.attr('href') || '';
-            // Strip Justia UTM tracking params
             if (website) {
                 try { website = website.split('?utm_source=justia')[0]; } catch {}
             }
@@ -281,7 +220,7 @@ const crawler = new CheerioCrawler({
             const lawSchool = $card.find('.jicon-education').closest('.iconed-line-small')
                 .clone().children('.jicon').remove().end().text().trim();
 
-            // Card tier (premium/gold/organic/claimed)
+            // Card tier (premium/gold/organic)
             const isPremium = $card.hasClass('-premium');
             const isGold = $card.hasClass('-gold');
             const cardTier = isPremium ? 'premium' : isGold ? 'gold' : 'organic';
@@ -289,43 +228,25 @@ const crawler = new CheerioCrawler({
             // Justia profile ID from data attribute
             const justiaProfileId = $card.attr('data-vars-profile') || '';
 
-            const lawyer = {
+            pageLawyers.push({
                 name,
-                firmName: '', // only available from profile page
                 profileUrl,
                 practiceAreas,
                 location,
                 phone,
-                rating,
-                reviewCount,
                 website,
-                email: '', // Justia never shows email
-                biography: '',
-                barAdmissions: [],
-                education: [],
                 lawSchool,
-                languages: [],
                 yearsExperience,
-                associations: [],
                 justiaClaimedProfile,
                 justiaProfileId,
                 cardTier,
-                latitude: null,
-                longitude: null,
                 source: 'justia',
                 scrapedAt: new Date().toISOString(),
-            };
-
-            pageLawyers.push(lawyer);
+            });
             stats.totalLawyersScraped++;
         }
 
-        // Push listing-only data to dataset (will be updated if enriched)
-        if (!enrichProfiles) {
-            await Actor.pushData(pageLawyers);
-        } else {
-            lawyersToEnrich.push(...pageLawyers);
-        }
+        await Actor.pushData(pageLawyers);
 
         log.info(`Page ${stats.pagesProcessed}: found ${pageLawyers.length} attorneys (total: ${stats.totalLawyersScraped})`);
 
@@ -346,186 +267,16 @@ const crawler = new CheerioCrawler({
 });
 
 log.info(`Starting Justia scraper: ${startUrl}`);
-log.info(`Settings: maxLawyers=${maxLawyers}, maxListingPages=${maxListingPages}, enrichProfiles=${enrichProfiles}`);
+log.info(`Settings: maxLawyers=${maxLawyers}, maxListingPages=${maxListingPages}`);
 
 await crawler.run([{ url: startUrl }]);
-
-// ── Phase 2: Profile enrichment (out-of-band via gotScraping) ──────────────
-if (enrichProfiles && lawyersToEnrich.length > 0) {
-    const blockRate = stats.totalRequests > 0
-        ? stats.blockedRequests / stats.totalRequests
-        : 0;
-
-    if (blockRate > 0.2) {
-        log.warning(`Block rate ${(blockRate * 100).toFixed(1)}% exceeds 20% threshold — skipping enrichment, pushing listing-only data`);
-        await Actor.pushData(lawyersToEnrich);
-    } else {
-        log.info(`Enriching ${lawyersToEnrich.length} profiles (block rate: ${(blockRate * 100).toFixed(1)}%)...`);
-
-        const CONCURRENCY = 5;
-        const enrichedLawyers = [];
-
-        for (let i = 0; i < lawyersToEnrich.length; i += CONCURRENCY) {
-            const batch = lawyersToEnrich.slice(i, i + CONCURRENCY);
-
-            const results = await Promise.allSettled(
-                batch.map(async (lawyer) => {
-                    const proxyUrl = await proxyConfiguration.newUrl();
-                    try {
-                        const response = await gotScraping({
-                            url: lawyer.profileUrl,
-                            proxyUrl,
-                            responseType: 'text',
-                            timeout: { request: 30000 },
-                            headers: {
-                                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                                'Accept-Language': 'en-US,en;q=0.9',
-                                'Accept-Encoding': 'gzip, deflate, br',
-                                'Cache-Control': 'no-cache',
-                                'Referer': 'https://www.justia.com/lawyers/',
-                            },
-                        });
-
-                        stats.totalRequests++;
-
-                        if ([403, 429, 503].includes(response.statusCode)) {
-                            stats.blockedRequests++;
-                            log.warning(`Blocked on profile: ${lawyer.profileUrl} (${response.statusCode})`);
-                            return lawyer;
-                        }
-
-                        const html = response.body;
-                        if (isCloudflareBlocked(html)) {
-                            stats.blockedRequests++;
-                            log.warning(`Cloudflare block on profile: ${lawyer.profileUrl}`);
-                            return lawyer;
-                        }
-
-                        // Save first successful profile HTML for debugging
-                        if (stats.profileEnrichments === 0) {
-                            const kvStore = await Actor.openKeyValueStore();
-                            await kvStore.setValue('DEBUG_PROFILE_SAMPLE', html, { contentType: 'text/html' });
-                            log.info(`Saved debug profile HTML for ${lawyer.profileUrl} (${html.length} chars)`);
-                        }
-
-                        const $ = cheerio.load(html);
-                        stats.profileEnrichments++;
-
-                        // JSON-LD first — Justia profile pages include structured data
-                        const jsonLd = extractJsonLd($);
-                        if (jsonLd) {
-                            log.debug(`JSON-LD found for ${lawyer.name}: @type=${jsonLd['@type']}`);
-                            lawyer.firmName = lawyer.firmName
-                                || jsonLd.worksFor?.name
-                                || jsonLd.memberOf?.name
-                                || '';
-
-                            if (jsonLd.geo) {
-                                lawyer.latitude = parseFloat(jsonLd.geo.latitude) || null;
-                                lawyer.longitude = parseFloat(jsonLd.geo.longitude) || null;
-                            }
-
-                            if (jsonLd.description) {
-                                lawyer.biography = jsonLd.description.substring(0, 2000);
-                            }
-
-                            // Bar admissions from JSON-LD
-                            if (jsonLd.hasCredential) {
-                                const creds = Array.isArray(jsonLd.hasCredential) ? jsonLd.hasCredential : [jsonLd.hasCredential];
-                                for (const cred of creds) {
-                                    const credText = cred.name || cred.credentialCategory || '';
-                                    if (credText) lawyer.barAdmissions.push(credText);
-                                }
-                            }
-
-                            // Education from JSON-LD
-                            if (jsonLd.alumniOf) {
-                                const schools = Array.isArray(jsonLd.alumniOf) ? jsonLd.alumniOf : [jsonLd.alumniOf];
-                                for (const school of schools) {
-                                    const name = school.name || (typeof school === 'string' ? school : '');
-                                    if (name) lawyer.education.push(name);
-                                }
-                            }
-                        }
-
-                        // Firm name from HTML if not found in JSON-LD
-                        if (!lawyer.firmName) {
-                            lawyer.firmName = extractFirmName($);
-                        }
-
-                        // Biography from HTML if not found in JSON-LD
-                        if (!lawyer.biography) {
-                            const bioEl = $('[itemprop="description"], .profile-blurb, .attorney-bio').first();
-                            lawyer.biography = bioEl.text().trim().substring(0, 2000);
-                        }
-
-                        // Bar admissions from HTML if not found in JSON-LD
-                        if (lawyer.barAdmissions.length === 0) {
-                            $('[itemprop="hasCredential"], .bar-admission, .license-item').each((_, el) => {
-                                const text = $(el).text().trim();
-                                if (text && text.length < 200) lawyer.barAdmissions.push(text);
-                            });
-                        }
-
-                        // Education from HTML if not found in JSON-LD
-                        if (lawyer.education.length === 0) {
-                            $('[itemprop="alumniOf"], .education-entry').each((_, el) => {
-                                const text = $(el).text().trim();
-                                if (text && text.length < 200) lawyer.education.push(text);
-                            });
-                        }
-
-                        // Languages
-                        $('[itemprop="knowsLanguage"], .language').each((_, el) => {
-                            const text = $(el).text().trim();
-                            if (text) lawyer.languages.push(text);
-                        });
-
-                        // Associations / memberships
-                        $('[itemprop="memberOf"], .association, .organization').each((_, el) => {
-                            const text = $(el).text().trim();
-                            if (text && text.length < 200) lawyer.associations.push(text);
-                        });
-
-                        // Website from profile page (if not found in listing)
-                        if (!lawyer.website) {
-                            const profileWebsite = $('a[aria-label$="Website"].rio-button, a[data-button-tag="website"]').first().attr('href') || '';
-                            const cleaned = profileWebsite.split('?utm_source=justia')[0];
-                            if (!isBlockedWebsite(cleaned)) {
-                                lawyer.website = cleaned;
-                            }
-                        }
-
-                        return lawyer;
-                    } catch (err) {
-                        log.warning(`Failed to enrich ${lawyer.profileUrl}: ${err.message}`);
-                        return lawyer;
-                    }
-                }),
-            );
-
-            for (const result of results) {
-                enrichedLawyers.push(result.status === 'fulfilled' ? result.value : batch[results.indexOf(result)]);
-            }
-
-            // Random delay between batches: 300-1200ms
-            if (i + CONCURRENCY < lawyersToEnrich.length) {
-                const delay = 300 + Math.random() * 900;
-                await new Promise((r) => setTimeout(r, delay));
-            }
-        }
-
-        await Actor.pushData(enrichedLawyers);
-        log.info(`Enrichment complete: ${stats.profileEnrichments}/${lawyersToEnrich.length} profiles enriched`);
-    }
-}
 
 // ── Save run statistics ────────────────────────────────────────────────────
 const blockRate = stats.totalRequests > 0
     ? (stats.blockedRequests / stats.totalRequests * 100).toFixed(1)
     : '0.0';
 
-log.info(`Run complete — ${stats.totalLawyersScraped} lawyers, ${stats.pagesProcessed} pages, ${stats.profileEnrichments} enrichments, ${blockRate}% blocked`);
+log.info(`Run complete — ${stats.totalLawyersScraped} lawyers, ${stats.pagesProcessed} pages, ${blockRate}% blocked`);
 
 const kvStore = await Actor.openKeyValueStore();
 await kvStore.setValue('RUN_STATISTICS', {
