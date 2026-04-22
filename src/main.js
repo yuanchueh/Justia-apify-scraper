@@ -72,25 +72,13 @@ function extractJsonLd($) {
     return null;
 }
 
-// ── Firm name heuristic (when schema.org attributes are absent) ────────────
-const FIRM_KEYWORDS = /\b(Law|Attorney|Legal|LLC|LLP|P\.?A\.?|Office|Firm|Group)\b/i;
-
+// ── Firm name extraction from profile pages ────────────────────────────────
 function extractFirmName($) {
-    // Try schema.org itemprop first
-    const itemprop = $('[itemprop="worksFor"]').text().trim()
+    // schema.org itemprop only — no heading heuristic (too error-prone)
+    return $('[itemprop="worksFor"]').text().trim()
         || $('[itemprop="memberOf"]').text().trim()
-        || $('[itemprop="affiliation"]').text().trim();
-    if (itemprop) return itemprop;
-
-    // Heuristic: scan headings for legal business keywords
-    const headings = $('h1, h2, h3, h4').toArray();
-    for (const el of headings) {
-        const text = $(el).text().trim();
-        if (FIRM_KEYWORDS.test(text) && text.length < 120) {
-            return text;
-        }
-    }
-    return '';
+        || $('[itemprop="affiliation"]').text().trim()
+        || '';
 }
 
 // ── Main actor ─────────────────────────────────────────────────────────────
@@ -216,14 +204,27 @@ const crawler = new CheerioCrawler({
             if (addressEl.length) {
                 // Normalize whitespace (tabs, newlines, multiple spaces → single space)
                 const raw = addressEl.text().replace(/[\t\n\r]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
-                // Extract "City, ST ZIP" pattern from the address text
-                const cityStateZip = raw.match(/([A-Za-z\s.]+,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?)/);
+                // Extract "City, ST ZIP" — city is word chars only (no digits) before comma
+                // This avoids capturing street fragments like "S Hillside St" or "th St."
+                const cityStateZip = raw.match(/\b([A-Za-z][A-Za-z\s.]*[A-Za-z]),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)/);
                 if (cityStateZip) {
-                    location = cityStateZip[1].trim();
+                    // Take only the last word(s) that look like a city name
+                    // Split on common street suffixes to isolate the city
+                    let city = cityStateZip[1];
+                    const streetSuffixCut = city.match(/(?:St\.?|Street|Ave\.?|Avenue|Blvd\.?|Rd\.?|Road|Dr\.?|Drive|Ct\.?|Ln\.?|Way|Suite|Ste\.?)\s+(.+)$/i);
+                    if (streetSuffixCut) city = streetSuffixCut[1];
+                    location = `${city.trim()}, ${cityStateZip[2]} ${cityStateZip[3]}`;
                 } else {
                     // Fallback: "City, ST" without ZIP
-                    const cityState = raw.match(/([A-Za-z\s.]+,\s*[A-Z]{2})\b/);
-                    location = cityState ? cityState[1].trim() : raw;
+                    const cityState = raw.match(/\b([A-Za-z][A-Za-z\s.]*[A-Za-z]),\s*([A-Z]{2})\b/);
+                    if (cityState) {
+                        let city = cityState[1];
+                        const streetSuffixCut = city.match(/(?:St\.?|Street|Ave\.?|Avenue|Blvd\.?|Rd\.?|Road|Dr\.?|Drive|Ct\.?|Ln\.?|Way|Suite|Ste\.?)\s+(.+)$/i);
+                        if (streetSuffixCut) city = streetSuffixCut[1];
+                        location = `${city.trim()}, ${cityState[2]}`;
+                    } else {
+                        location = raw;
+                    }
                 }
             }
             if (!location) {
