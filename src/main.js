@@ -125,7 +125,7 @@ async function classifyPage(page) {
 // challenge auto-solves in a real browser after a few seconds, so a visible
 // challenge is not yet a block — only a challenge that PERSISTS past the
 // patience window (or a hard block page) counts as blocked.
-const CHALLENGE_PATIENCE_MS = 45_000;
+const CHALLENGE_PATIENCE_MS = 55_000;
 const POLL_MS = 1_500;
 const QUIET_POLLS_FOR_EMPTY = 4; // ~6s of stable non-challenge DOM => genuinely cardless page
 
@@ -237,8 +237,15 @@ const crawler = new PlaywrightCrawler({
             gotoOptions.waitUntil = 'domcontentloaded';
             if (session?.userData?.lastUrl) gotoOptions.referer = session.userData.lastUrl;
             // Residential bandwidth is the dominant cost — drop images/media/
-            // fonts. Keep scripts/styles/XHR: the challenge needs them.
+            // fonts. Keep scripts/styles/XHR: the challenge needs them. NEVER
+            // touch Cloudflare's own challenge assets (challenges.cloudflare.com,
+            // /cdn-cgi/) — aborting them can stall the managed challenge and
+            // waste the first attempt.
             await page.route('**/*', (route) => {
+                const url = route.request().url();
+                if (url.includes('challenges.cloudflare.com') || url.includes('/cdn-cgi/')) {
+                    return route.continue();
+                }
                 const type = route.request().resourceType();
                 if (type === 'image' || type === 'media' || type === 'font') return route.abort();
                 return route.continue();
