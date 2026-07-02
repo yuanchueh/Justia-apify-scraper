@@ -71,7 +71,13 @@ function parseListingTotal($) {
         [metaText, /compare\s+([\d,]+)\+?\s+[^.]{0,80}?(?:attorneys?|lawyers?)\b/i],
         [bodyText, /showing\s+[\d,]+\s*(?:[-–—]|to)\s*[\d,]+\s+of\s+([\d,]+)/i],
         [bodyText, /\bof\s+([\d,]+)\+?\s+(?:attorneys?|lawyers?|results)\b/i],
-        [bodyText, /([\d,]+)\+?\s+(?:attorneys?|lawyers?)\s+(?:found|match(?:ed)?|serving|in)\b/i],
+        // NOTE: no "N lawyers serving/in ..." pattern — whole-state hub pages
+        // carry "Top 10 Lawyer Serving <State>" award badges that false-match
+        // (verified on /lawyers/tennessee: listingTotal=10 from badges; the
+        // hub page publishes NO directory total — meta description is
+        // numberless). A false total corrupts the verified-exhaustive
+        // denominator; null is honest and handled downstream.
+        [bodyText, /([\d,]+)\+?\s+(?:attorneys?|lawyers?)\s+(?:found|match(?:ed)?)\b/i],
     ];
     for (const [text, re] of candidates) {
         const match = text.match(re);
