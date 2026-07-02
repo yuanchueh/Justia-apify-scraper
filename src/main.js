@@ -17,6 +17,7 @@
 
 import { Actor, log } from 'apify';
 import { CheerioCrawler } from 'crawlee';
+import { ImpitHttpClient, Browser } from '@crawlee/impit-client';
 
 // ── Blocked website hosts (social media, directories) ──────────────────────
 const BLOCKED_WEBSITE_HOSTS = new Set([
@@ -117,10 +118,19 @@ let listingTotalChecked = false;
 let reachedListingEnd = false;   // RUN_STATS.reachedListingEnd — true ONLY on natural pagination end
 
 // ── Listing crawler ────────────────────────────────────────────────────────
+// Justia sits behind Cloudflare, which blocks at the TLS/HTTP-fingerprint layer
+// (JA3/JA4 + HTTP2), NOT at the header layer — a plain got-scraping request (the
+// CheerioCrawler default) hard-403s every retry no matter how good the headers,
+// because the block is below HTTP. ImpitHttpClient replays a real Chrome TLS +
+// HTTP2 fingerprint, which is what actually clears the challenge. Cheerio-only:
+// no headless browser, so per-request cost stays ~got-scraping-level.
 const crawler = new CheerioCrawler({
     proxyConfiguration,
+    httpClient: new ImpitHttpClient({ browser: Browser.Chrome, http3: false }),
     maxRequestRetries: 8,
     maxRequestsPerCrawl: 500,
+    useSessionPool: true,
+    persistCookiesPerSession: true,   // keep __cf_bm within a session to cut re-challenges
     sessionPoolOptions: {
         maxPoolSize: 10,
         sessionOptions: {
