@@ -285,16 +285,16 @@ const crawler = new PlaywrightCrawler({
             if (listingTotal !== null) {
                 log.info(`Listing total: ${listingTotal}`);
             } else {
-                // Save the rendered page so the count markup can be inspected
-                // when the parser misses — listingTotal=null keeps the
-                // coverage cell unverified downstream. (Same pattern as the
-                // Avvo actor's LISTING_DEBUG_HTML.)
-                log.warning('listingTotal parse missed; saving LISTING_DEBUG_HTML.');
-                try {
-                    await Actor.setValue('LISTING_DEBUG_HTML', await page.content(), { contentType: 'text/html' });
-                } catch (e) {
-                    log.warning(`Could not save LISTING_DEBUG_HTML: ${e.message}`);
-                }
+                log.warning('listingTotal parse missed.');
+            }
+            // Always save the first rendered listing page: audits the parsed
+            // total against the real markup (a FALSE total is worse than a
+            // null one — it corrupts the verified-exhaustive denominator) and
+            // catches Justia markup drift. One KV write per run.
+            try {
+                await Actor.setValue('LISTING_DEBUG_HTML', await page.content(), { contentType: 'text/html' });
+            } catch (e) {
+                log.warning(`Could not save LISTING_DEBUG_HTML: ${e.message}`);
             }
         }
 
