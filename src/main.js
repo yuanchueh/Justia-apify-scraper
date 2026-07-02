@@ -8,6 +8,10 @@
  * Profile enrichment (firmName, bio, barAdmissions) is handled downstream
  * in the Python pipeline via firm website scraping.
  *
+ * At run end (even on failure/abort) writes the RUN_STATS key-value record
+ * — the complete-coverage contract the sales_engine pipeline reads:
+ * {listingTotal, reachedListingEnd, blockedRatio, pagesCrawled, uniqueProfiles}.
+ *
  * Requires US residential proxies — Justia uses Cloudflare IP-tier blocking.
  */
 
@@ -51,14 +55,42 @@ function isCloudflareBlocked(html) {
     );
 }
 
+// ── Listing total detection ────────────────────────────────────────────────
+// Directory-wide total for RUN_STATS.listingTotal, parsed once from the first
+// listing page. Justia states it in the meta description ("Compare 380
+// personal injury attorneys in Kansas on Justia."); older layouts used visible
+// "showing X - Y of N" / "N lawyers" text. Returns an int or null — never
+// guesses. A null total keeps the coverage cell unverified downstream.
+function parseListingTotal($) {
+    const metaText = [
+        $('meta[name="description"]').attr('content') || '',
+        $('meta[property="og:description"]').attr('content') || '',
+    ].join(' ');
+    const bodyText = $('body').text().replace(/\s+/g, ' ');
+    const candidates = [
+        [metaText, /compare\s+([\d,]+)\+?\s+[^.]{0,80}?(?:attorneys?|lawyers?)\b/i],
+        [bodyText, /showing\s+[\d,]+\s*(?:[-–—]|to)\s*[\d,]+\s+of\s+([\d,]+)/i],
+        [bodyText, /\bof\s+([\d,]+)\+?\s+(?:attorneys?|lawyers?|results)\b/i],
+        [bodyText, /([\d,]+)\+?\s+(?:attorneys?|lawyers?)\s+(?:found|match(?:ed)?|serving|in)\b/i],
+    ];
+    for (const [text, re] of candidates) {
+        const match = text.match(re);
+        if (match) {
+            const n = parseInt(match[1].replace(/,/g, ''), 10);
+            if (!Number.isNaN(n)) return n;
+        }
+    }
+    return null;
+}
+
 // ── Main actor ─────────────────────────────────────────────────────────────
 await Actor.init();
 
 const input = await Actor.getInput();
 const {
     startUrl,
-    maxLawyers = 20,
-    maxListingPages = 10,
+    maxLawyers = 0,
+    maxListingPages = 0,
     proxyConfiguration: proxyInput,
 } = input ?? {};
 
@@ -80,6 +112,9 @@ const stats = {
     totalRequests: 0,
 };
 let debugPageCount = 0;
+let listingTotal = null;         // RUN_STATS.listingTotal — parsed once from the first listing page
+let listingTotalChecked = false;
+let reachedListingEnd = false;   // RUN_STATS.reachedListingEnd — true ONLY on natural pagination end
 
 // ── Listing crawler ────────────────────────────────────────────────────────
 const crawler = new CheerioCrawler({
@@ -120,7 +155,15 @@ const crawler = new CheerioCrawler({
             session.userData.lastUrl = request.url;
         }
 
+        // Parse the directory total once, from the first successfully fetched page
+        if (!listingTotalChecked) {
+            listingTotalChecked = true;
+            listingTotal = parseListingTotal($);
+            log.info(`Listing total: ${listingTotal === null ? 'not found' : listingTotal}`);
+        }
+
         // Extract attorney cards from listing page
+        stats.pagesProcessed++;
         const cards = $('div.jld-card').toArray();
 
         if (cards.length === 0) {
@@ -128,10 +171,13 @@ const crawler = new CheerioCrawler({
             const kvStore = await Actor.openKeyValueStore();
             await kvStore.setValue(`DEBUG_NO_RESULTS_${debugPageCount}`, html, { contentType: 'text/html' });
             log.warning(`No attorney cards found on ${request.url} — saved debug HTML`);
+            // A page yielding zero profile URLs is a natural end of the listing
+            // (verified-zero cells depend on this; a mis-render cannot falsely
+            // verify because the listingTotal*0.95 gate decides downstream).
+            reachedListingEnd = true;
             return;
         }
 
-        stats.pagesProcessed++;
         const pageLawyers = [];
 
         for (const card of cards) {
@@ -250,40 +296,80 @@ const crawler = new CheerioCrawler({
 
         log.info(`Page ${stats.pagesProcessed}: found ${pageLawyers.length} attorneys (total: ${stats.totalLawyersScraped})`);
 
-        // Pagination
-        if (stats.pagesProcessed < maxListingPages &&
-            (maxLawyers === 0 || stats.totalLawyersScraped < maxLawyers)) {
+        // Pagination — 0 means unlimited; reachedListingEnd flips true ONLY on
+        // a natural end (no new profiles, or no next link), never on a cap.
+        const lawyersCapReached = maxLawyers > 0 && stats.totalLawyersScraped >= maxLawyers;
+        const pagesCapReached = maxListingPages > 0 && stats.pagesProcessed >= maxListingPages;
+
+        if (lawyersCapReached || pagesCapReached) {
+            log.info(`Cap reached (maxLawyers=${maxLawyers}, maxListingPages=${maxListingPages}) — stopping pagination`);
+        } else if (pageLawyers.length === 0) {
+            // Cards present but every profile URL already seen (Justia repeats
+            // premium/gold attorneys across pages) — the listing has run out.
+            reachedListingEnd = true;
+            log.info(`No new profiles on ${request.url} — natural end of listing`);
+        } else {
             const nextLink = $('span.next a, .pagination .next a, a[rel="next"]').first().attr('href');
             if (nextLink) {
                 const nextUrl = new URL(nextLink, request.url).href;
                 await crawler.addRequests([{ url: nextUrl }]);
+            } else {
+                reachedListingEnd = true; // last page — no next link
             }
         }
     },
     async failedRequestHandler({ request }) {
+        // A permanently failed request never reached requestHandler, so count
+        // it as both seen and blocked — hard 403/challenge failures must move
+        // blockedRatio instead of leaving totalRequests at 0.
+        stats.totalRequests++;
         stats.blockedRequests++;
         log.error(`Request permanently failed: ${request.url}`);
     },
 });
 
-log.info(`Starting Justia scraper: ${startUrl}`);
-log.info(`Settings: maxLawyers=${maxLawyers}, maxListingPages=${maxListingPages}`);
+// ── Run statistics ─────────────────────────────────────────────────────────
+function blockedRatio() {
+    return stats.totalRequests > 0 ? stats.blockedRequests / stats.totalRequests : 0;
+}
 
-await crawler.run([{ url: startUrl }]);
+async function saveRunStats() {
+    const kvStore = await Actor.openKeyValueStore();
+    // Complete-coverage contract (sales_engine spec §4.2.3) — the pipeline
+    // reads these five exact field names; do not rename.
+    await kvStore.setValue('RUN_STATS', {
+        listingTotal,
+        reachedListingEnd,
+        blockedRatio: blockedRatio(),
+        pagesCrawled: stats.pagesProcessed,
+        uniqueProfiles: seenProfileUrls.size,
+    });
+    // Legacy human-oriented record, kept for continuity with earlier runs.
+    await kvStore.setValue('RUN_STATISTICS', {
+        ...stats,
+        blockRate: `${(blockedRatio() * 100).toFixed(1)}%`,
+        startUrl,
+        completedAt: new Date().toISOString(),
+    });
+}
 
-// ── Save run statistics ────────────────────────────────────────────────────
-const blockRate = stats.totalRequests > 0
-    ? (stats.blockedRequests / stats.totalRequests * 100).toFixed(1)
-    : '0.0';
-
-log.info(`Run complete — ${stats.totalLawyersScraped} lawyers, ${stats.pagesProcessed} pages, ${blockRate}% blocked`);
-
-const kvStore = await Actor.openKeyValueStore();
-await kvStore.setValue('RUN_STATISTICS', {
-    ...stats,
-    blockRate: `${blockRate}%`,
-    startUrl,
-    completedAt: new Date().toISOString(),
+// Graceful platform aborts emit 'aborting' with a short grace period —
+// report whatever was collected (reachedListingEnd stays false).
+Actor.on('aborting', () => {
+    saveRunStats().catch((err) => log.exception(err, 'Failed to save RUN_STATS on abort'));
 });
+
+log.info(`Starting Justia scraper: ${startUrl}`);
+log.info(`Settings: maxLawyers=${maxLawyers === 0 ? 'unlimited' : maxLawyers}, maxListingPages=${maxListingPages === 0 ? 'unlimited' : maxListingPages}`);
+
+try {
+    await crawler.run([{ url: startUrl }]);
+} finally {
+    // finally-style: crashed/bailed runs still report RUN_STATS.
+    await saveRunStats().catch((err) => log.exception(err, 'Failed to save RUN_STATS'));
+}
+
+log.info(`Run complete — ${stats.totalLawyersScraped} lawyers, ${stats.pagesProcessed} pages, `
+    + `${(blockedRatio() * 100).toFixed(1)}% blocked, reachedListingEnd=${reachedListingEnd}`);
 
 await Actor.exit();
