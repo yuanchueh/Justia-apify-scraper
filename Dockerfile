@@ -1,11 +1,20 @@
-FROM apify/actor-node:20
+# Playwright + Chromium base image. The tag pins playwright 1.60.0 — the
+# "playwright" version in package.json MUST match it exactly, otherwise the
+# npm module looks for browser binaries of a different revision than the
+# ones preinstalled in the image and the actor dies at launch.
+FROM apify/actor-node-playwright-chrome:20-1.60.0
 
-# NOTE: do NOT pass --omit=optional. impit (browser-TLS HTTP client) ships its
-# native binding as a platform-specific optionalDependency (impit-linux-x64-gnu);
-# omitting optional deps drops it and the actor fails at runtime with
-# "cannot find native binding".
-COPY package*.json ./
-RUN npm install --omit=dev
+COPY --chown=myuser package*.json ./
 
-COPY . ./
-CMD npm start
+RUN npm --quiet set progress=false \
+    && npm install --omit=dev --omit=optional \
+    && echo "Installed NPM packages:" \
+    && (npm list --omit=dev --all || true) \
+    && echo "Node.js version:" \
+    && node --version \
+    && echo "NPM version:" \
+    && npm --version
+
+COPY --chown=myuser . ./
+
+CMD npm start --silent

@@ -2,14 +2,14 @@
     "name": "justia-scraper",
     "version": "0.0.1",
     "type": "module",
-    "description": "Apify actor to scrape attorney profiles from Justia.com lawyer directory",
+    "description": "Apify actor to scrape attorney profiles from Justia.com lawyer directory (Playwright/Chromium)",
     "engines": {
         "node": ">=20"
     },
     "dependencies": {
-        "@crawlee/impit-client": "^3.17.0",
         "apify": "^3.7.2",
-        "crawlee": "^3.17.0"
+        "crawlee": "^3.17.0",
+        "playwright": "1.60.0"
     },
     "scripts": {
         "start": "node src/main.js"

@@ -1,7 +1,18 @@
 /**
  * Justia Lawyer Directory Scraper — Apify Actor
  *
- * Scrapes attorney listing pages from Justia.com (div.jld-card).
+ * Scrapes attorney listing pages from Justia.com (div.jld-card) with a real
+ * headless Chromium browser (PlaywrightCrawler).
+ *
+ * Why a browser: Justia sits behind Cloudflare bot management and the block
+ * is NOT clearable at the HTTP layer. got-scraping (header impersonation)
+ * hard-403'd every retry; impit (real Chrome TLS/JA3 + HTTP/2 replay) ALSO
+ * hard-403'd (run JtHNnWoRP0c7xZRcS, blockedRatio 1.0). Passing requires
+ * executing the Cloudflare JS challenge, which only a real browser can do.
+ * Chromium + crawlee fingerprint injection + US residential proxy clears the
+ * managed challenge; the cf_clearance cookie then rides the (single, sticky)
+ * session through pagination without re-challenging.
+ *
  * Extracts: name, phone, website, practiceAreas, location, lawSchool,
  * yearsExperience, cardTier, justiaClaimedProfile, justiaProfileId.
  *
@@ -12,12 +23,11 @@
  * — the complete-coverage contract the sales_engine pipeline reads:
  * {listingTotal, reachedListingEnd, blockedRatio, pagesCrawled, uniqueProfiles}.
  *
- * Requires US residential proxies — Justia uses Cloudflare IP-tier blocking.
+ * Requires US residential proxies — Cloudflare also scores at the IP tier.
  */
 
 import { Actor, log } from 'apify';
-import { CheerioCrawler } from 'crawlee';
-import { ImpitHttpClient, Browser } from '@crawlee/impit-client';
+import { PlaywrightCrawler, sleep } from 'crawlee';
 
 // ── Blocked website hosts (social media, directories) ──────────────────────
 const BLOCKED_WEBSITE_HOSTS = new Set([
@@ -43,17 +53,6 @@ function isBlockedWebsite(url) {
     } catch {
         return true; // malformed URL
     }
-}
-
-// ── Cloudflare detection ───────────────────────────────────────────────────
-function isCloudflareBlocked(html) {
-    const snippet = (html || '').substring(0, 5000);
-    return (
-        snippet.includes('Just a moment') ||
-        snippet.includes('cf-browser-verification') ||
-        snippet.includes('Checking your browser') ||
-        snippet.includes('Cloudflare')
-    );
 }
 
 // ── Listing total detection ────────────────────────────────────────────────
@@ -84,6 +83,74 @@ function parseListingTotal($) {
     return null;
 }
 
+// ── Cloudflare page classification ─────────────────────────────────────────
+// 'cards'      — listing rendered (div.jld-card present): success.
+// 'challenge'  — interstitial ("Just a moment…"): may auto-solve, keep waiting.
+// 'hardblock'  — definite block page (1020/1015 "you have been blocked"):
+//                never auto-solves, fail fast and rotate.
+// 'plain'      — rendered non-challenge page without cards (empty listing or
+//                past the last page).
+// 'transition' — DOM unreadable mid-navigation; poll again.
+async function classifyPage(page) {
+    try {
+        if (await page.$('div.jld-card')) return 'cards';
+        const probe = await page.evaluate(() => ({
+            title: document.title || '',
+            text: document.body ? document.body.innerText.slice(0, 3000) : '',
+        }));
+        const t = `${probe.title}\n${probe.text}`.toLowerCase();
+        if (
+            t.includes('sorry, you have been blocked')
+            || t.includes('attention required')
+            || t.includes('access denied')
+            || t.includes('error 1020')
+            || t.includes('error 1015')
+            || t.includes('error 1010')
+        ) return 'hardblock';
+        if (
+            t.includes('just a moment')
+            || t.includes('checking your browser')
+            || t.includes('verify you are human')
+            || t.includes('verifying you are human')
+            || t.includes('needs to review the security of your connection')
+            || t.includes('enable javascript and cookies to continue')
+        ) return 'challenge';
+        return 'plain';
+    } catch {
+        return 'transition';
+    }
+}
+
+// Wait for the listing selector OR a definite outcome. Cloudflare's managed
+// challenge auto-solves in a real browser after a few seconds, so a visible
+// challenge is not yet a block — only a challenge that PERSISTS past the
+// patience window (or a hard block page) counts as blocked.
+const CHALLENGE_PATIENCE_MS = 45_000;
+const POLL_MS = 1_500;
+const QUIET_POLLS_FOR_EMPTY = 4; // ~6s of stable non-challenge DOM => genuinely cardless page
+
+async function waitForCardsOrBlock(page) {
+    const deadline = Date.now() + CHALLENGE_PATIENCE_MS;
+    let sawChallenge = false;
+    let quietPolls = 0;
+    let state = await classifyPage(page);
+    while (Date.now() < deadline) {
+        if (state === 'cards' || state === 'hardblock') break;
+        if (state === 'plain') {
+            quietPolls++;
+            if (quietPolls >= QUIET_POLLS_FOR_EMPTY) break;
+        } else {
+            quietPolls = 0;
+            if (state === 'challenge') sawChallenge = true;
+        }
+        await sleep(POLL_MS);
+        state = await classifyPage(page);
+    }
+    // Timed out mid-challenge/transition => blocked; stable 'plain' => empty page.
+    const blocked = state === 'hardblock' || state === 'challenge' || state === 'transition';
+    return { blocked, state, sawChallenge };
+}
+
 // ── Main actor ─────────────────────────────────────────────────────────────
 await Actor.init();
 
@@ -110,7 +177,7 @@ const stats = {
     totalLawyersScraped: 0,
     pagesProcessed: 0,
     blockedRequests: 0,
-    totalRequests: 0,
+    totalRequests: 0,      // navigations that produced a document (+ final failures)
 };
 let debugPageCount = 0;
 let listingTotal = null;         // RUN_STATS.listingTotal — parsed once from the first listing page
@@ -118,46 +185,81 @@ let listingTotalChecked = false;
 let reachedListingEnd = false;   // RUN_STATS.reachedListingEnd — true ONLY on natural pagination end
 
 // ── Listing crawler ────────────────────────────────────────────────────────
-// Justia sits behind Cloudflare, which blocks at the TLS/HTTP-fingerprint layer
-// (JA3/JA4 + HTTP2), NOT at the header layer — a plain got-scraping request (the
-// CheerioCrawler default) hard-403s every retry no matter how good the headers,
-// because the block is below HTTP. ImpitHttpClient replays a real Chrome TLS +
-// HTTP2 fingerprint, which is what actually clears the challenge. Cheerio-only:
-// no headless browser, so per-request cost stays ~got-scraping-level.
-const crawler = new CheerioCrawler({
+// Real Chromium, sequential pagination. One session at a time (maxPoolSize 1)
+// so the cf_clearance cookie, the sticky residential IP, and the browser
+// fingerprint stay consistent across pages — Cloudflare binds clearance to
+// IP + fingerprint, so rotating sessions per page would re-challenge every
+// navigation. On a block we retire BOTH the session (new IP) and the browser
+// (new fingerprint) and let crawlee retry.
+const crawler = new PlaywrightCrawler({
     proxyConfiguration,
-    httpClient: new ImpitHttpClient({ browser: Browser.Chrome, http3: false }),
-    maxRequestRetries: 8,
+    launchContext: {
+        launchOptions: {
+            args: [
+                '--disable-blink-features=AutomationControlled',
+                '--lang=en-US',
+            ],
+        },
+    },
+    browserPoolOptions: {
+        useFingerprints: true, // default, made explicit — headless-signal patching
+        fingerprintOptions: {
+            fingerprintGeneratorOptions: {
+                browsers: ['chrome'],
+                operatingSystems: ['windows'],
+                locales: ['en-US'],
+            },
+        },
+    },
+    maxConcurrency: 2,           // pagination discovers pages serially; stays ~1 in practice
+    maxRequestRetries: 5,
     maxRequestsPerCrawl: 500,
+    navigationTimeoutSecs: 90,   // residential proxies are slow; challenge adds redirects
+    requestHandlerTimeoutSecs: 180,
     useSessionPool: true,
-    persistCookiesPerSession: true,   // keep __cf_bm within a session to cut re-challenges
+    persistCookiesPerSession: true,
     sessionPoolOptions: {
-        maxPoolSize: 10,
+        maxPoolSize: 1,          // single sticky session: cookie/IP/fingerprint continuity
         sessionOptions: {
             maxUsageCount: 50,
         },
+        // CRITICAL: the Cloudflare challenge itself arrives as a 403. The
+        // session pool's default blockedStatusCodes ([401,403,429]) would
+        // throw before the browser gets a chance to run and solve the
+        // challenge — disable status-code auto-blocking; classifyPage()
+        // decides what is actually blocked.
+        blockedStatusCodes: [],
     },
     preNavigationHooks: [
-        (crawlingContext) => {
-            const { session } = crawlingContext;
-            if (session?.userData?.lastUrl) {
-                crawlingContext.request.headers = {
-                    ...crawlingContext.request.headers,
-                    Referer: session.userData.lastUrl,
-                };
-            }
+        async ({ page, session }, gotoOptions) => {
+            // The challenge interstitial holds the 'load' event hostage;
+            // return on DOM ready and let waitForCardsOrBlock() do the rest.
+            gotoOptions.waitUntil = 'domcontentloaded';
+            if (session?.userData?.lastUrl) gotoOptions.referer = session.userData.lastUrl;
+            // Residential bandwidth is the dominant cost — drop images/media/
+            // fonts. Keep scripts/styles/XHR: the challenge needs them.
+            await page.route('**/*', (route) => {
+                const type = route.request().resourceType();
+                if (type === 'image' || type === 'media' || type === 'font') return route.abort();
+                return route.continue();
+            });
         },
     ],
-    async requestHandler({ request, $, session }) {
+    async requestHandler({ request, page, response, session, parseWithCheerio, crawler: crawlerRef }) {
         stats.totalRequests++;
-        const html = $.html();
 
-        // Cloudflare check
-        if (isCloudflareBlocked(html)) {
+        const { blocked, state, sawChallenge } = await waitForCardsOrBlock(page);
+        if (blocked) {
             stats.blockedRequests++;
-            if (session) session.markBad();
-            log.warning(`Cloudflare block on ${request.url}`);
-            throw new Error('Cloudflare blocked — will retry with new session');
+            const status = response?.status?.() ?? 'n/a';
+            log.warning(`Cloudflare ${state} persisted on ${request.url} (HTTP ${status}, sawChallenge=${sawChallenge})`);
+            session?.retire();
+            // New fingerprint next attempt, not just a new IP.
+            await crawlerRef.browserPool.retireBrowserByPage(page);
+            throw new Error(`Cloudflare blocked (${state}) — retrying with fresh session + browser`);
+        }
+        if (sawChallenge) {
+            log.info(`Cloudflare challenge auto-solved on ${request.url}`);
         }
 
         if (session) {
@@ -165,11 +267,28 @@ const crawler = new CheerioCrawler({
             session.userData.lastUrl = request.url;
         }
 
+        // Cheerio over the RENDERED DOM — parsing below is unchanged from the
+        // CheerioCrawler versions of this actor.
+        const $ = await parseWithCheerio();
+
         // Parse the directory total once, from the first successfully fetched page
         if (!listingTotalChecked) {
             listingTotalChecked = true;
             listingTotal = parseListingTotal($);
-            log.info(`Listing total: ${listingTotal === null ? 'not found' : listingTotal}`);
+            if (listingTotal !== null) {
+                log.info(`Listing total: ${listingTotal}`);
+            } else {
+                // Save the rendered page so the count markup can be inspected
+                // when the parser misses — listingTotal=null keeps the
+                // coverage cell unverified downstream. (Same pattern as the
+                // Avvo actor's LISTING_DEBUG_HTML.)
+                log.warning('listingTotal parse missed; saving LISTING_DEBUG_HTML.');
+                try {
+                    await Actor.setValue('LISTING_DEBUG_HTML', await page.content(), { contentType: 'text/html' });
+                } catch (e) {
+                    log.warning(`Could not save LISTING_DEBUG_HTML: ${e.message}`);
+                }
+            }
         }
 
         // Extract attorney cards from listing page
@@ -178,8 +297,11 @@ const crawler = new CheerioCrawler({
 
         if (cards.length === 0) {
             debugPageCount++;
-            const kvStore = await Actor.openKeyValueStore();
-            await kvStore.setValue(`DEBUG_NO_RESULTS_${debugPageCount}`, html, { contentType: 'text/html' });
+            try {
+                await Actor.setValue(`DEBUG_NO_RESULTS_${debugPageCount}`, await page.content(), { contentType: 'text/html' });
+            } catch (e) {
+                log.warning(`Could not save DEBUG_NO_RESULTS_${debugPageCount}: ${e.message}`);
+            }
             log.warning(`No attorney cards found on ${request.url} — saved debug HTML`);
             // A page yielding zero profile URLs is a natural end of the listing
             // (verified-zero cells depend on this; a mis-render cannot falsely
@@ -329,9 +451,9 @@ const crawler = new CheerioCrawler({
         }
     },
     async failedRequestHandler({ request }) {
-        // A permanently failed request never reached requestHandler, so count
-        // it as both seen and blocked — hard 403/challenge failures must move
-        // blockedRatio instead of leaving totalRequests at 0.
+        // A request that exhausted its retries counts as both seen and blocked
+        // — persistent challenge/403 failures must move blockedRatio instead
+        // of leaving totalRequests at 0.
         stats.totalRequests++;
         stats.blockedRequests++;
         log.error(`Request permanently failed: ${request.url}`);
@@ -369,7 +491,7 @@ Actor.on('aborting', () => {
     saveRunStats().catch((err) => log.exception(err, 'Failed to save RUN_STATS on abort'));
 });
 
-log.info(`Starting Justia scraper: ${startUrl}`);
+log.info(`Starting Justia scraper (Playwright/Chromium): ${startUrl}`);
 log.info(`Settings: maxLawyers=${maxLawyers === 0 ? 'unlimited' : maxLawyers}, maxListingPages=${maxListingPages === 0 ? 'unlimited' : maxListingPages}`);
 
 try {
