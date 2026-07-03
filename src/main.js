@@ -13,6 +13,13 @@
  * managed challenge; the cf_clearance cookie then rides the (single, sticky)
  * session through pagination without re-challenging.
  *
+ * Justia listings serve TRUE matches first, then pad with unrelated lawyers
+ * from the wider directory up to a ~1,000-item/25-page server cap (verified:
+ * WY wrongful-death listingTotal=10 served 1,002; every TN city ended at
+ * ~1,000). stopAtListingTotal (default true) therefore stops collection once
+ * uniqueProfiles reaches the parsed listingTotal and reports
+ * reachedListingEnd=true — the remainder is padding, not coverage.
+ *
  * Extracts: name, phone, website, practiceAreas, location, lawSchool,
  * yearsExperience, cardTier, justiaClaimedProfile, justiaProfileId.
  *
@@ -28,6 +35,8 @@
 
 import { Actor, log } from 'apify';
 import { PlaywrightCrawler, sleep } from 'crawlee';
+
+import { listingTotalSatisfied } from './stop_rules.js';
 
 // ── Blocked website hosts (social media, directories) ──────────────────────
 const BLOCKED_WEBSITE_HOSTS = new Set([
@@ -165,6 +174,7 @@ const {
     startUrl,
     maxLawyers = 0,
     maxListingPages = 0,
+    stopAtListingTotal = true,
     proxyConfiguration: proxyInput,
 } = input ?? {};
 
@@ -327,6 +337,9 @@ const crawler = new PlaywrightCrawler({
 
         for (const card of cards) {
             if (maxLawyers > 0 && stats.totalLawyersScraped >= maxLawyers) break;
+            // True matches come first; cards past listingTotal are padding.
+            if (listingTotalSatisfied({ stopAtListingTotal, listingTotal,
+                uniqueProfiles: seenProfileUrls.size })) break;
 
             const $card = $(card);
 
@@ -442,11 +455,21 @@ const crawler = new PlaywrightCrawler({
         log.info(`Page ${stats.pagesProcessed}: found ${pageLawyers.length} attorneys (total: ${stats.totalLawyersScraped})`);
 
         // Pagination — 0 means unlimited; reachedListingEnd flips true ONLY on
-        // a natural end (no new profiles, or no next link), never on a cap.
+        // a natural end: listingTotal collected (the rest is padding), no new
+        // profiles, or no next link. Never on a maxLawyers/maxListingPages cap.
         const lawyersCapReached = maxLawyers > 0 && stats.totalLawyersScraped >= maxLawyers;
         const pagesCapReached = maxListingPages > 0 && stats.pagesProcessed >= maxListingPages;
+        const totalSatisfied = listingTotalSatisfied({ stopAtListingTotal, listingTotal,
+            uniqueProfiles: seenProfileUrls.size });
 
-        if (lawyersCapReached || pagesCapReached) {
+        if (totalSatisfied) {
+            // Checked before the caps: >= listingTotal uniques is direct
+            // evidence of complete coverage even when a cap fired on the
+            // same page.
+            reachedListingEnd = true;
+            log.info(`listingTotal ${listingTotal} collected (${seenProfileUrls.size} unique) `
+                + '— stopping before the padding');
+        } else if (lawyersCapReached || pagesCapReached) {
             log.info(`Cap reached (maxLawyers=${maxLawyers}, maxListingPages=${maxListingPages}) — stopping pagination`);
         } else if (pageLawyers.length === 0) {
             // Cards present but every profile URL already seen (Justia repeats
@@ -505,7 +528,9 @@ Actor.on('aborting', () => {
 });
 
 log.info(`Starting Justia scraper (Playwright/Chromium): ${startUrl}`);
-log.info(`Settings: maxLawyers=${maxLawyers === 0 ? 'unlimited' : maxLawyers}, maxListingPages=${maxListingPages === 0 ? 'unlimited' : maxListingPages}`);
+log.info(`Settings: maxLawyers=${maxLawyers === 0 ? 'unlimited' : maxLawyers}, `
+    + `maxListingPages=${maxListingPages === 0 ? 'unlimited' : maxListingPages}, `
+    + `stopAtListingTotal=${stopAtListingTotal}`);
 
 try {
     await crawler.run([{ url: startUrl }]);

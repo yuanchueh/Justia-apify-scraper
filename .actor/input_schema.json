@@ -25,6 +25,12 @@
             "default": 0,
             "minimum": 0
         },
+        "stopAtListingTotal": {
+            "title": "Stop at listing total",
+            "type": "boolean",
+            "description": "Stop once unique profiles reach the parsed directory total and report reachedListingEnd=true. Justia lists true matches first, then pads with unrelated lawyers up to a ~1,000-item server cap — everything past the total is padding, not coverage. Disable only to audit the padding itself.",
+            "default": true
+        },
         "proxyConfiguration": {
             "title": "Proxy Configuration",
             "type": "object",

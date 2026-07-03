@@ -12,7 +12,8 @@
         "playwright": "1.60.0"
     },
     "scripts": {
-        "start": "node src/main.js"
+        "start": "node src/main.js",
+        "test": "node --test"
     },
     "author": "yuanchueh"
 }

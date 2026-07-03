@@ -2,3 +2,5 @@ node_modules/
 storage/
 .git/
 .gitignore
+test/
+desktop.ini
