@@ -13,18 +13,19 @@
  * managed challenge; the cf_clearance cookie then rides the (single, sticky)
  * session through pagination without re-challenging.
  *
- * Justia pads listings with unrelated lawyers from the wider directory up to
- * a ~1,000-item/25-page server cap (verified: every TN city ended at ~1,000).
- * stopAtListingTotal (default true) handles both padding shapes:
- * - Dedicated listing with a parsed "Compare N ..." total: stop collecting
- *   once uniqueProfiles reaches N (true matches come first; the rest is
- *   padding) and report reachedListingEnd=true.
- * - Sparse-combo hub fallback: a PA×place combo with too few lawyers is
- *   served as the broader state/city hub — canonical drops the PA segment
- *   (verified live 2026-07-02: /lawyers/wrongful-death/wyoming served
- *   canonical /lawyers/wyoming, 1,002 items, numberless meta). The listing
- *   does not exist: report listingTotal=0, uniqueProfiles=0,
- *   reachedListingEnd=true (verified-zero cell downstream).
+ * Justia's two listing shapes (both live-verified 2026-07-02):
+ * - Dedicated PA listings hold ONLY true matches and end naturally at their
+ *   true count (KS personal-injury: 393 uniques / 10 pages, all injury-
+ *   related). Their meta is numberless as of 2026-07, so listingTotal
+ *   usually parses null; the coverage pipeline verifies these structurally.
+ * - Hub pages (state/city) list everything up to a ~1,000-item/25-page
+ *   server cap, and a sparse PA×place combo is SERVED as the broader hub —
+ *   canonical drops the PA segment (/lawyers/wrongful-death/wyoming was the
+ *   WY hub: 1,002 items, numberless meta).
+ * stopAtListingTotal (default true) turns a detected hub serve into a
+ * verified-zero report (listingTotal=0, uniqueProfiles=0,
+ * reachedListingEnd=true) instead of ~25 pages of padding, and — should
+ * Justia republish "Compare N" totals — stops collection at N uniques.
  *
  * Extracts: name, phone, website, practiceAreas, location, lawSchool,
  * yearsExperience, cardTier, justiaClaimedProfile, justiaProfileId.

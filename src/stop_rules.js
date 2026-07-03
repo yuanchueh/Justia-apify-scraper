@@ -1,16 +1,18 @@
 /**
  * Stop-at-listing-total rule.
  *
- * Justia listing pages serve the TRUE matches first, then pad the remainder
- * with unrelated lawyers from the wider directory up to a ~1,000-item/25-page
- * server cap (verified: WY wrongful-death listingTotal=10 served 1,002 items;
- * every TN city listing ended at ~1,000). So once uniqueProfiles reaches the
- * parsed listingTotal, everything that follows — on this page and every page
- * after — is padding, not coverage.
+ * If a listing publishes a parseable total N, everything past the first N
+ * unique profiles is padding — stop there. As of 2026-07 Justia's dedicated
+ * PA listings publish NO total (numberless meta) and hold only true matches,
+ * so this rule is dormant on them and pagination ends naturally; it re-arms
+ * automatically if Justia republishes "Compare N" totals. The actor-forced
+ * listingTotal=0 from hub-fallback detection (servedBroaderListing) satisfies
+ * at zero: collect nothing, the whole page is hub padding.
  *
  * Totals the parse missed (null) never satisfy: pagination must run to its
- * natural end. Totals above the server cap can never be satisfied either —
- * the run ends at the cap and downstream coverage stays honestly partial.
+ * natural end. Totals above the ~1,000-item server cap can never be satisfied
+ * either — the run ends at the cap and downstream coverage stays honestly
+ * partial.
  */
 export function listingTotalSatisfied({ stopAtListingTotal, listingTotal, uniqueProfiles }) {
     if (!stopAtListingTotal) return false;

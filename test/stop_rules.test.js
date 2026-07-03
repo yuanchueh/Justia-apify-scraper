@@ -3,10 +3,11 @@ import assert from 'node:assert/strict';
 
 import { listingTotalSatisfied, servedBroaderListing } from '../src/stop_rules.js';
 
-// Justia listings serve true matches FIRST, then pad with unrelated lawyers up
-// to a ~1,000-item/25-page server cap (verified: WY wrongful-death
-// listingTotal=10 served 1,002; every TN city ended at ~1,000). Once
-// uniqueProfiles reaches the parsed listingTotal, everything after is padding.
+// As of 2026-07 Justia's dedicated PA listings publish no total (numberless
+// meta) and hold only true matches, so this rule is dormant there and re-arms
+// if totals return. Hub pages cap at ~1,000 items (WY hub served 1,002; TN
+// cities ended at ~1,000 each); the actor-forced listingTotal=0 from
+// hub-fallback detection satisfies at zero — collect nothing.
 
 test('satisfied exactly at the parsed total (WY wrongful-death: 10 of 10)', () => {
     assert.equal(
