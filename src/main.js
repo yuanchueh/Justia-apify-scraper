@@ -13,12 +13,18 @@
  * managed challenge; the cf_clearance cookie then rides the (single, sticky)
  * session through pagination without re-challenging.
  *
- * Justia listings serve TRUE matches first, then pad with unrelated lawyers
- * from the wider directory up to a ~1,000-item/25-page server cap (verified:
- * WY wrongful-death listingTotal=10 served 1,002; every TN city ended at
- * ~1,000). stopAtListingTotal (default true) therefore stops collection once
- * uniqueProfiles reaches the parsed listingTotal and reports
- * reachedListingEnd=true — the remainder is padding, not coverage.
+ * Justia pads listings with unrelated lawyers from the wider directory up to
+ * a ~1,000-item/25-page server cap (verified: every TN city ended at ~1,000).
+ * stopAtListingTotal (default true) handles both padding shapes:
+ * - Dedicated listing with a parsed "Compare N ..." total: stop collecting
+ *   once uniqueProfiles reaches N (true matches come first; the rest is
+ *   padding) and report reachedListingEnd=true.
+ * - Sparse-combo hub fallback: a PA×place combo with too few lawyers is
+ *   served as the broader state/city hub — canonical drops the PA segment
+ *   (verified live 2026-07-02: /lawyers/wrongful-death/wyoming served
+ *   canonical /lawyers/wyoming, 1,002 items, numberless meta). The listing
+ *   does not exist: report listingTotal=0, uniqueProfiles=0,
+ *   reachedListingEnd=true (verified-zero cell downstream).
  *
  * Extracts: name, phone, website, practiceAreas, location, lawSchool,
  * yearsExperience, cardTier, justiaClaimedProfile, justiaProfileId.
@@ -36,7 +42,7 @@
 import { Actor, log } from 'apify';
 import { PlaywrightCrawler, sleep } from 'crawlee';
 
-import { listingTotalSatisfied } from './stop_rules.js';
+import { listingTotalSatisfied, servedBroaderListing } from './stop_rules.js';
 
 // ── Blocked website hosts (social media, directories) ──────────────────────
 const BLOCKED_WEBSITE_HOSTS = new Set([
@@ -297,12 +303,6 @@ const crawler = new PlaywrightCrawler({
         // Parse the directory total once, from the first successfully fetched page
         if (!listingTotalChecked) {
             listingTotalChecked = true;
-            listingTotal = parseListingTotal($);
-            if (listingTotal !== null) {
-                log.info(`Listing total: ${listingTotal}`);
-            } else {
-                log.warning('listingTotal parse missed.');
-            }
             // Always save the first rendered listing page: audits the parsed
             // total against the real markup (a FALSE total is worse than a
             // null one — it corrupts the verified-exhaustive denominator) and
@@ -311,6 +311,28 @@ const crawler = new PlaywrightCrawler({
                 await Actor.setValue('LISTING_DEBUG_HTML', await page.content(), { contentType: 'text/html' });
             } catch (e) {
                 log.warning(`Could not save LISTING_DEBUG_HTML: ${e.message}`);
+            }
+            // Sparse-combo hub fallback: a PA×place combo with too few lawyers
+            // is served as the broader state/city hub (canonical drops the PA
+            // segment) — the requested listing does not exist, so the cell is
+            // a verified zero. Any total parsed here would be the HUB's, not
+            // this listing's.
+            const canonicalHref = $('link[rel="canonical"]').attr('href') || '';
+            if (stopAtListingTotal && servedBroaderListing({
+                requestedUrl: request.url, canonicalUrl: canonicalHref,
+            })) {
+                listingTotal = 0;
+                reachedListingEnd = true;
+                stats.pagesProcessed++;
+                log.warning(`Requested listing does not exist: ${request.url} was served as `
+                    + `${canonicalHref} (hub fallback) — reporting verified-zero listing`);
+                return;
+            }
+            listingTotal = parseListingTotal($);
+            if (listingTotal !== null) {
+                log.info(`Listing total: ${listingTotal}`);
+            } else {
+                log.warning('listingTotal parse missed.');
             }
         }
 

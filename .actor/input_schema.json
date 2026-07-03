@@ -28,7 +28,7 @@
         "stopAtListingTotal": {
             "title": "Stop at listing total",
             "type": "boolean",
-            "description": "Stop once unique profiles reach the parsed directory total and report reachedListingEnd=true. Justia lists true matches first, then pads with unrelated lawyers up to a ~1,000-item server cap — everything past the total is padding, not coverage. Disable only to audit the padding itself.",
+            "description": "Stop once unique profiles reach the parsed directory total (true matches come first; the rest is padding up to a ~1,000-item server cap) and report reachedListingEnd=true. Also detects Justia's sparse-combo fallback — a practice-area URL served as the broader state/city hub (canonical drops the PA segment) — and reports it as a verified-zero listing (listingTotal=0) instead of crawling ~25 pages of padding. Disable only to audit the padding itself.",
             "default": true
         },
         "proxyConfiguration": {

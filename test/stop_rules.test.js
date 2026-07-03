@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { listingTotalSatisfied } from '../src/stop_rules.js';
+import { listingTotalSatisfied, servedBroaderListing } from '../src/stop_rules.js';
 
 // Justia listings serve true matches FIRST, then pad with unrelated lawyers up
 // to a ~1,000-item/25-page server cap (verified: WY wrongful-death
@@ -58,4 +58,64 @@ test('garbage totals never satisfy (NaN, negative, non-integer)', () => {
             `listingTotal=${String(bad)} must not satisfy`,
         );
     }
+});
+
+// Sparse-combo hub fallback: when a practice-area×place combo has too few
+// lawyers, Justia serves the broader state/city hub instead of a dedicated
+// listing — the canonical URL drops the practice-area segment (verified live
+// 2026-07-02: requesting /lawyers/wrongful-death/wyoming served canonical
+// /lawyers/wyoming with the whole ~1,000-lawyer state directory). A broader
+// serve means the requested listing does not exist: verified zero.
+
+test('state hub fallback detected (WY wrongful-death, verified live)', () => {
+    assert.equal(servedBroaderListing({
+        requestedUrl: 'https://www.justia.com/lawyers/wrongful-death/wyoming',
+        canonicalUrl: 'https://www.justia.com/lawyers/wyoming',
+    }), true);
+});
+
+test('city hub fallback detected (PA segment dropped from city listing)', () => {
+    assert.equal(servedBroaderListing({
+        requestedUrl: 'https://www.justia.com/lawyers/wrongful-death/tennessee/nashville',
+        canonicalUrl: 'https://www.justia.com/lawyers/tennessee/nashville',
+    }), true);
+});
+
+test('self-canonical dedicated listing is not a fallback', () => {
+    assert.equal(servedBroaderListing({
+        requestedUrl: 'https://www.justia.com/lawyers/personal-injury/kansas',
+        canonicalUrl: 'https://www.justia.com/lawyers/personal-injury/kansas',
+    }), false);
+});
+
+test('trailing slash, case, and host differences are not fallbacks', () => {
+    assert.equal(servedBroaderListing({
+        requestedUrl: 'https://www.justia.com/lawyers/Personal-Injury/kansas/',
+        canonicalUrl: 'https://justia.com/lawyers/personal-injury/kansas',
+    }), false);
+});
+
+test('missing or malformed canonical gives no signal', () => {
+    for (const canonicalUrl of ['', null, undefined, 'not a url']) {
+        assert.equal(servedBroaderListing({
+            requestedUrl: 'https://www.justia.com/lawyers/wrongful-death/wyoming',
+            canonicalUrl,
+        }), false, `canonical=${String(canonicalUrl)} must not signal`);
+    }
+});
+
+test('same-depth canonical (slug rename) is not a broader listing', () => {
+    // A renamed slug keeps the segment count — never mistake it for a hub
+    // serve and silently zero a cell that actually has a dataset.
+    assert.equal(servedBroaderListing({
+        requestedUrl: 'https://www.justia.com/lawyers/products-liability/kansas',
+        canonicalUrl: 'https://www.justia.com/lawyers/product-liability/kansas',
+    }), false);
+});
+
+test('query strings are ignored when comparing listing paths', () => {
+    assert.equal(servedBroaderListing({
+        requestedUrl: 'https://www.justia.com/lawyers/wrongful-death/wyoming?page=1',
+        canonicalUrl: 'https://www.justia.com/lawyers/wyoming?ref=x',
+    }), true);
 });
